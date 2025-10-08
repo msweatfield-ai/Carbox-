@@ -11,46 +11,63 @@ from playwright.async_api import async_playwright
 BASE = "https://www.carboxautosales.com"
 INV_URL = f"{BASE}/inventory/"
 
-VIN_RE  = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+VIN_RE   = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
+YEAR_RE  = re.compile(r"\b(19|20)\d{2}\b")
+PRICE_RE = re.compile(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{2})?")  # $12,345 or 12345
 
 # ----------------------------
 # HTML parsing helpers
 # ----------------------------
+def _clean_price(val: str) -> str:
+    if not val: return ""
+    m = PRICE_RE.search(val.replace("\u00A0"," ").replace("\u202F"," "))
+    if not m: return ""
+    num = m.group(1).replace(",", "")
+    try:
+        return str(int(float(num)))
+    except Exception:
+        return ""
+
 def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
-    """Pull Year/Make/Model/VIN from DOM text + JSON-LD, with URL-based fallbacks."""
+    """Pull Year/Make/Model/VIN/Price from DOM text + JSON-LD, with URL-based fallbacks."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # --- VIN from JSON-LD if present
+    # --- VIN & price from JSON-LD if present
     vin = None
+    price = ""
     for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t.lower()):
         try:
             data = json.loads(tag.string or "")
-            stack = [data]
-            while stack:
-                cur = stack.pop()
-                if isinstance(cur, dict):
-                    for _, v in cur.items():
-                        if isinstance(v, (dict, list)):
-                            stack.append(v)
-                        elif isinstance(v, str) and VIN_RE.fullmatch(v.strip()):
-                            vin = v.strip().upper()
-                            break
-                elif isinstance(cur, list):
-                    stack.extend(cur)
-                if vin:
-                    break
         except Exception:
-            pass
-        if vin:
-            break
+            continue
+        stack = [data]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                # price keys sometimes under offers.price
+                if "offers" in cur and isinstance(cur["offers"], (dict, list)):
+                    stack.append(cur["offers"])
+                for k, v in cur.items():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+                    elif isinstance(v, str):
+                        s = v.strip()
+                        if not vin and VIN_RE.fullmatch(s):
+                            vin = s.upper()
+                        if not price:
+                            p = _clean_price(s)
+                            if p: price = p
+            elif isinstance(cur, list):
+                stack.extend(cur)
 
-    # --- VIN from visible text
+    # --- Fallback: VIN/price from visible text
     if not vin:
         m = VIN_RE.search(text)
         if m:
             vin = m.group(1).upper()
+    if not price:
+        price = _clean_price(text)
 
     # --- Year / Make / Model
     title = (soup.title.string if soup.title else "").strip()
@@ -96,11 +113,12 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
         "make":  make or "",
         "model": model or "",
         "vin":   vin or "",
+        "price": price or "",
         "url":   url or url_hint or ""
     }
 
 # ----------------------------
-# Listing page crawling
+# Listing page crawling (handles 12-per-page pagination)
 # ----------------------------
 async def collect_vehicle_urls(playwright) -> list:
     """Return a de-duped list of vehicle detail URLs across ALL inventory pages."""
@@ -116,21 +134,18 @@ async def collect_vehicle_urls(playwright) -> list:
                 if not href:
                     continue
                 href = urljoin(BASE, href)
-                # skip inventory root
                 if href.rstrip("/") in {BASE + "/inventory", BASE + "/inventory/"}:
                     continue
                 urls.add(href.split("?")[0].split("#")[0])
             return urls
 
         async def discover_next_pages() -> list:
-            """Find next/numbered pagination links on the current page."""
             found = set()
             sel = "a[rel='next'], a[aria-label*='Next' i], a:has-text('Next'), a:has-text('›'), a:has-text('»')"
             for a in await page.locator(sel).all():
                 href = await a.get_attribute("href")
                 if href:
                     found.add(urljoin(BASE, href))
-            # numbered pages (1..N)
             for a in await page.locator("a").all():
                 try:
                     text = (await a.inner_text() or "").strip()
@@ -148,7 +163,7 @@ async def collect_vehicle_urls(playwright) -> list:
         seen_listing_pages = set()
         to_visit = [INV_URL]
 
-        # brute-force patterns up to 20 pages to avoid missing hidden pagination
+        # brute-force patterns up to 20 pages
         for i in range(2, 21):
             to_visit.append(f"{INV_URL}?page={i}")
             to_visit.append(urljoin(INV_URL, f"page/{i}/"))
@@ -164,15 +179,12 @@ async def collect_vehicle_urls(playwright) -> list:
             except Exception:
                 continue
 
-            # lazy load
             for _ in range(6):
                 await page.mouse.wheel(0, 20000)
                 await page.wait_for_timeout(250)
 
-            # vehicle links
             all_vehicle_links |= await harvest_vehicle_links_on_page()
 
-            # discover linked pagination from this page
             for nxt in await discover_next_pages():
                 if nxt not in seen_listing_pages:
                     to_visit.append(nxt)
@@ -182,10 +194,9 @@ async def collect_vehicle_urls(playwright) -> list:
         await browser.close()
 
 # ----------------------------
-# Scrape detail pages (DOM + JSON)
+# Scrape detail pages (DOM + JSON; also collects price from JSON)
 # ----------------------------
 async def scrape_today() -> list:
-    """Scrape vehicle pages and return dicts with year/make/model/vin/url (unique by VIN)."""
     async with async_playwright() as pw:
         urls = await collect_vehicle_urls(pw)
 
@@ -194,10 +205,10 @@ async def scrape_today() -> list:
         try:
             page = await browser.new_page()
 
-            json_vins = set()
+            json_vins   = set()
+            json_prices = dict()  # map VIN -> price seen in JSON
 
             async def handle_response(resp):
-                """Collect any VINs present in background JSON responses."""
                 try:
                     ct = (resp.headers or {}).get("content-type", "")
                 except Exception:
@@ -213,23 +224,30 @@ async def scrape_today() -> list:
                 while stack:
                     cur = stack.pop()
                     if isinstance(cur, dict):
-                        for _, v in cur.items():
+                        for k, v in cur.items():
                             if isinstance(v, (dict, list)):
                                 stack.append(v)
-                            elif isinstance(v, str) and VIN_RE.fullmatch(v.strip()):
-                                json_vins.add(v.strip().upper())
+                            elif isinstance(v, str):
+                                s = v.strip()
+                                if VIN_RE.fullmatch(s):
+                                    json_vins.add(s.upper())
+                                else:
+                                    p = _clean_price(s)
+                                    if p and json_vins:
+                                        # associate last seen VIN if we have one; best-effort
+                                        for vv in list(json_vins):
+                                            json_prices.setdefault(vv, p)
                     elif isinstance(cur, list):
                         stack.extend(cur)
 
-            # ✅ Correct way to register the event handler
             page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
             for u in urls:
                 try:
                     await page.goto(u, wait_until="networkidle", timeout=60000)
-                    await page.wait_for_timeout(600)  # let late JS finish
+                    await page.wait_for_timeout(600)
+
                     html = await page.content()
-                    # include plain text for frameworks that hide text from HTML
                     try:
                         body_text = await page.evaluate("document.body.innerText")
                         if body_text:
@@ -238,12 +256,18 @@ async def scrape_today() -> list:
                         pass
 
                     specs = extract_specs_from_html(html, url_hint=u)
+
+                    # fill missing VIN/price from JSON signals
                     if not specs["vin"] and json_vins:
                         used = {r["vin"] for r in rows if r.get("vin")}
                         for v in json_vins:
                             if v not in used:
                                 specs["vin"] = v
                                 break
+                    if specs["vin"] and not specs["price"]:
+                        p = json_prices.get(specs["vin"], "")
+                        if p:
+                            specs["price"] = p
 
                     if specs["vin"]:
                         rows.append(specs)
@@ -261,12 +285,12 @@ async def scrape_today() -> list:
         return list(uniq.values())
 
 # ----------------------------
-# IO / diff / rollup
+# IO / diff / rollup (now includes price changes)
 # ----------------------------
 def load_prev_inventory(path: str) -> pd.DataFrame:
     if Path(path).exists():
         return pd.read_csv(path, dtype=str).fillna("")
-    return pd.DataFrame(columns=["date","year","make","model","vin","url"])
+    return pd.DataFrame(columns=["date","year","make","model","vin","price","url"])
 
 def rollup(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -287,17 +311,20 @@ def main():
     # previous snapshot (if any)
     prev_files = sorted(out_dir.glob("inventory_*.csv"))
     prev_path  = prev_files[-1] if prev_files else None
-    prev       = load_prev_inventory(prev_path) if prev_path else pd.DataFrame(columns=["date","year","make","model","vin","url"])
+    prev       = load_prev_inventory(prev_path) if prev_path else pd.DataFrame(columns=["date","year","make","model","vin","price","url"])
 
     # scrape
     rows = asyncio.run(scrape_today())
     df = pd.DataFrame(rows).drop_duplicates(subset=["vin"]).fillna("")
+    # ensure price is numeric-like string
+    if "price" not in df.columns: df["price"] = ""
+    df["price"] = df["price"].astype(str).str.replace(r"[^0-9]", "", regex=True)
     df.insert(0, "date", today)
 
     # write today's snapshot
     (out_dir / f"inventory_{today}.csv").write_text(df.to_csv(index=False))
 
-    # compute deltas
+    # compute adds/removes
     if prev.empty:
         added = df.copy()
         removed = pd.DataFrame(columns=df.columns)
@@ -307,15 +334,46 @@ def main():
         added   = df[df["vin"].isin(curr_vins - prev_vins)].copy()
         removed = prev[prev["vin"].isin(prev_vins - curr_vins)].copy()
 
-    # write rollups + delta
+    # compute price changes (VIN present in both, price differs and both non-empty)
+    price_changes = pd.DataFrame(columns=["date","vin","year","make","model","old_price","new_price","delta","url"])
+    if not prev.empty:
+        merged = pd.merge(
+            prev[["vin","price","year","make","model","url"]],
+            df[["vin","price","year","make","model","url"]],
+            on="vin", how="inner", suffixes=("_old","_new")
+        )
+        def to_int(s):
+            try: return int(str(s).replace(",","").strip())
+            except: return None
+        changed = []
+        for _, r in merged.iterrows():
+            old = to_int(r["price_old"]); new = to_int(r["price_new"])
+            if old is not None and new is not None and old != new:
+                changed.append({
+                    "date": today,
+                    "vin": r["vin"],
+                    "year": r["year_new"] or r["year_old"],
+                    "make": (r["make_new"] or r["make_old"]).upper(),
+                    "model": (r["model_new"] or r["model_old"]).upper(),
+                    "old_price": str(old),
+                    "new_price": str(new),
+                    "delta": str(new - old),
+                    "url": r["url_new"] or r["url_old"]
+                })
+        if changed:
+            price_changes = pd.DataFrame(changed)
+
+    # write rollups + delta + price changes
     rollup(added).to_csv(out_dir / f"added_by_group_{today}.csv",     index=False)
     rollup(removed).to_csv(out_dir / f"removed_by_group_{today}.csv", index=False)
     pd.concat(
         [added.assign(change="added"), removed.assign(change="removed")],
         ignore_index=True
     ).to_csv(out_dir / f"delta_{today}.csv", index=False)
+    if not price_changes.empty:
+        price_changes.to_csv(out_dir / f"price_changes_{today}.csv", index=False)
 
-    print(f"Vehicle pages scraped: {len(rows)} | unique VINs: {df.shape[0]}")
+    print(f"Vehicle pages scraped: {len(rows)} | unique VINs: {df.shape[0]} | price changes: {0 if price_changes.empty else len(price_changes)}")
 
 if __name__ == "__main__":
     main()
