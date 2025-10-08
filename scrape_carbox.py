@@ -15,14 +15,14 @@ VIN_RE  = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 # ----------------------------
-# Helpers
+# HTML parsing helpers
 # ----------------------------
 def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
-    """Pull Year / Make / Model / VIN from DOM text + JSON-LD, with URL-based fallbacks."""
+    """Pull Year/Make/Model/VIN from DOM text + JSON-LD, with URL-based fallbacks."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # 1) VIN from JSON-LD, if present
+    # --- VIN from JSON-LD if present
     vin = None
     for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t.lower()):
         try:
@@ -31,7 +31,7 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
             while stack:
                 cur = stack.pop()
                 if isinstance(cur, dict):
-                    for k, v in cur.items():
+                    for _, v in cur.items():
                         if isinstance(v, (dict, list)):
                             stack.append(v)
                         elif isinstance(v, str) and VIN_RE.fullmatch(v.strip()):
@@ -46,13 +46,13 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
         if vin:
             break
 
-    # 2) VIN from visible text
+    # --- VIN from visible text
     if not vin:
         m = VIN_RE.search(text)
         if m:
             vin = m.group(1).upper()
 
-    # Year / Make / Model guesses
+    # --- Year / Make / Model
     title = (soup.title.string if soup.title else "").strip()
     year = ""
     ym = YEAR_RE.search((title or "").upper())
@@ -62,7 +62,7 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
     make = ""
     model = ""
 
-    # URL-based fallback for make/model
+    # URL-based fallback for make/model (common dealer URL pattern)
     url = url_hint or ""
     canonical = soup.find("link", rel="canonical")
     if canonical and canonical.get("href"):
@@ -75,7 +75,7 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
             make = parts[0].upper()
             model = parts[1].upper()
 
-    # SPECIFICATIONS block (if used by platform)
+    # SPECIFICATIONS block (if platform exposes it)
     spec_block = soup.find(string=re.compile(r"SPECIFICATIONS", re.I))
     if spec_block:
         blk = spec_block.find_parent()
@@ -99,103 +99,93 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
         "url":   url or url_hint or ""
     }
 
-async def discover_listing_pages(page) -> list:
-    """
-    Find additional listing pages (pagination / load-more).
-    Returns a list including the main inventory URL.
-    """
-    seen  = {INV_URL}
-    queue = [INV_URL]
-
-    async def harvest_pagination_links():
-        anchors = await page.locator("a").all()
-        urls = set()
-        for a in anchors:
-            href = await a.get_attribute("href")
-            if not href:
-                continue
-            href = urljoin(BASE, href)
-            path = urlparse(href).path.lower()
-            if "/inventory" in path:
-                if any(q in href.lower() for q in ["?page=", "/page/", "?pg=", "&page="]):
-                    urls.add(href)
-        return urls
-
-    # Scroll & click common load-more buttons
-    for _ in range(8):
-        await page.mouse.wheel(0, 20000)
-        await page.wait_for_timeout(500)
-        for label in ["load more", "show more", "more results", "next", "›", "»"]:
-            btn = page.locator(f"button:has-text('{label}') , a:has-text('{label}')")
-            if await btn.count() > 0:
-                try:
-                    await btn.first.click()
-                    await page.wait_for_load_state("networkidle")
-                except Exception:
-                    pass
-
-    # collect explicit pagination links
-    for u in await harvest_pagination_links():
-        if u not in seen:
-            seen.add(u)
-            queue.append(u)
-
-    # visit new listing pages too (rarely surfaces more)
-    for u in queue[1:]:
-        try:
-            await page.goto(u, wait_until="networkidle")
-            await page.mouse.wheel(0, 20000)
-            await page.wait_for_timeout(500)
-            for m in await harvest_pagination_links():
-                if m not in seen:
-                    seen.add(m)
-                    queue.append(m)
-        except Exception:
-            pass
-
-    return queue
-
-async def harvest_vehicle_links_on_page(page) -> set:
-    """Collect all links under /inventory/ that are likely vehicle detail pages."""
-    urls = set()
-    anchors = await page.locator("a[href*='/inventory/']").all()
-    for a in anchors:
-        href = await a.get_attribute("href")
-        if not href:
-            continue
-        href = urljoin(BASE, href)
-        # Drop the inventory root itself
-        if href.rstrip("/") in {BASE + "/inventory", BASE + "/inventory/"}:
-            continue
-        urls.add(href.split("?")[0].split("#")[0])
-    return urls
-
+# ----------------------------
+# Listing page crawling
+# ----------------------------
 async def collect_vehicle_urls(playwright) -> list:
-    """Return a de-duped list of vehicle detail URLs across all listing pages."""
+    """Return a de-duped list of vehicle detail URLs across ALL inventory pages."""
     browser = await playwright.chromium.launch()
     try:
         page = await browser.new_page()
+
+        async def harvest_vehicle_links_on_page() -> set:
+            urls = set()
+            anchors = await page.locator("a[href*='/inventory/']").all()
+            for a in anchors:
+                href = await a.get_attribute("href")
+                if not href:
+                    continue
+                href = urljoin(BASE, href)
+                # skip inventory root
+                if href.rstrip("/") in {BASE + "/inventory", BASE + "/inventory/"}:
+                    continue
+                urls.add(href.split("?")[0].split("#")[0])
+            return urls
+
+        async def discover_next_pages() -> list:
+            """Find next/numbered pagination links on the current page."""
+            found = set()
+            sel = "a[rel='next'], a[aria-label*='Next' i], a:has-text('Next'), a:has-text('›'), a:has-text('»')"
+            for a in await page.locator(sel).all():
+                href = await a.get_attribute("href")
+                if href:
+                    found.add(urljoin(BASE, href))
+            # numbered pages (1..N)
+            for a in await page.locator("a").all():
+                try:
+                    text = (await a.inner_text() or "").strip()
+                except Exception:
+                    continue
+                if text.isdigit():
+                    href = await a.get_attribute("href")
+                    if href:
+                        found.add(urljoin(BASE, href))
+            return sorted(found)
+
+        # start with page 1
         await page.goto(INV_URL, wait_until="networkidle")
+        all_vehicle_links = set()
+        seen_listing_pages = set()
+        to_visit = [INV_URL]
 
-        listing_pages = await discover_listing_pages(page)
+        # brute-force patterns up to 20 pages to avoid missing hidden pagination
+        for i in range(2, 21):
+            to_visit.append(f"{INV_URL}?page={i}")
+            to_visit.append(urljoin(INV_URL, f"page/{i}/"))
 
-        all_links = set()
-        for url in listing_pages:
+        while to_visit:
+            url = to_visit.pop(0)
+            if url in seen_listing_pages:
+                continue
+            seen_listing_pages.add(url)
+
             try:
-                await page.goto(url, wait_until="networkidle")
-                for _ in range(6):
-                    await page.mouse.wheel(0, 20000)
-                    await page.wait_for_timeout(300)
-                all_links |= await harvest_vehicle_links_on_page(page)
+                await page.goto(url, wait_until="networkidle", timeout=60000)
             except Exception:
-                pass
+                continue
 
-        return sorted(all_links)
+            # lazy load
+            for _ in range(6):
+                await page.mouse.wheel(0, 20000)
+                await page.wait_for_timeout(250)
+
+            # vehicle links
+            all_vehicle_links |= await harvest_vehicle_links_on_page()
+
+            # discover linked pagination from this page
+            for nxt in await discover_next_pages():
+                if nxt not in seen_listing_pages:
+                    to_visit.append(nxt)
+
+        return sorted(all_vehicle_links)
     finally:
         await browser.close()
 
+# ----------------------------
+# Scrape detail pages (DOM + JSON)
+# ----------------------------
 async def scrape_today() -> list:
-    """Scrape all vehicle pages and return a list of dicts (year/make/model/vin/url)."""
+    """Scrape vehicle pages and return dicts with year/make/model/vin/url (unique by VIN)."""
     async with async_playwright() as pw:
         urls = await collect_vehicle_urls(pw)
 
@@ -204,7 +194,7 @@ async def scrape_today() -> list:
         try:
             page = await browser.new_page()
 
-            # capture VINs that appear only in background JSON
+            # Capture VINs that appear only in background JSON calls
             json_vins = set()
 
             def looks_like_inventory_json(resp):
@@ -240,10 +230,9 @@ async def scrape_today() -> list:
             for u in urls:
                 try:
                     await page.goto(u, wait_until="networkidle", timeout=60000)
-                    await page.wait_for_timeout(600)  # let late JS settle
-
+                    await page.wait_for_timeout(600)  # let late JS finish
                     html = await page.content()
-                    # include plain text (some frameworks hide text from HTML)
+                    # include plain text for frameworks that hide text from HTML
                     try:
                         body_text = await page.evaluate("document.body.innerText")
                         if body_text:
@@ -253,11 +242,11 @@ async def scrape_today() -> list:
 
                     specs = extract_specs_from_html(html, url_hint=u)
                     if not specs["vin"] and json_vins:
-                        # use a VIN seen in JSON but not yet used
                         used = {r["vin"] for r in rows if r.get("vin")}
-                        candidates = [v for v in json_vins if v not in used]
-                        if candidates:
-                            specs["vin"] = candidates[0]
+                        for v in json_vins:
+                            if v not in used:
+                                specs["vin"] = v
+                                break
 
                     if specs["vin"]:
                         rows.append(specs)
@@ -269,11 +258,14 @@ async def scrape_today() -> list:
         # de-dupe by VIN
         uniq = {}
         for r in rows:
-            vin = r.get("vin", "")
-            if vin and vin not in uniq:
-                uniq[vin] = r
+            v = r.get("vin", "")
+            if v and v not in uniq:
+                uniq[v] = r
         return list(uniq.values())
 
+# ----------------------------
+# IO / diff / rollup
+# ----------------------------
 def load_prev_inventory(path: str) -> pd.DataFrame:
     if Path(path).exists():
         return pd.read_csv(path, dtype=str).fillna("")
@@ -319,7 +311,7 @@ def main():
         removed = prev[prev["vin"].isin(prev_vins - curr_vins)].copy()
 
     # write rollups + delta
-    rollup(added).to_csv(out_dir / f"added_by_group_{today}.csv",   index=False)
+    rollup(added).to_csv(out_dir / f"added_by_group_{today}.csv",     index=False)
     rollup(removed).to_csv(out_dir / f"removed_by_group_{today}.csv", index=False)
     pd.concat(
         [added.assign(change="added"), removed.assign(change="removed")],
