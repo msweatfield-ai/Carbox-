@@ -16,18 +16,23 @@ YEAR_RE  = re.compile(r"\b(19|20)\d{2}\b")
 PRICE_RE = re.compile(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{2})?")  # $12,345 or 12345
 
 # ----------------------------
-# HTML parsing helpers
+# Utilities
 # ----------------------------
 def _clean_price(val: str) -> str:
-    if not val: return ""
-    m = PRICE_RE.search(val.replace("\u00A0"," ").replace("\u202F"," "))
-    if not m: return ""
+    if not val:
+        return ""
+    m = PRICE_RE.search(val.replace("\u00A0", " ").replace("\u202F", " "))
+    if not m:
+        return ""
     num = m.group(1).replace(",", "")
     try:
         return str(int(float(num)))
     except Exception:
         return ""
 
+# ----------------------------
+# HTML parsing helpers
+# ----------------------------
 def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
     """Pull Year/Make/Model/VIN/Price from DOM text + JSON-LD, with URL-based fallbacks."""
     soup = BeautifulSoup(html, "html.parser")
@@ -45,10 +50,10 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
         while stack:
             cur = stack.pop()
             if isinstance(cur, dict):
-                # price keys sometimes under offers.price
+                # offers.price is common
                 if "offers" in cur and isinstance(cur["offers"], (dict, list)):
                     stack.append(cur["offers"])
-                for k, v in cur.items():
+                for _, v in cur.items():
                     if isinstance(v, (dict, list)):
                         stack.append(v)
                     elif isinstance(v, str):
@@ -57,7 +62,8 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
                             vin = s.upper()
                         if not price:
                             p = _clean_price(s)
-                            if p: price = p
+                            if p:
+                                price = p
             elif isinstance(cur, list):
                 stack.extend(cur)
 
@@ -103,10 +109,12 @@ def extract_specs_from_html(html: str, url_hint: str = "") -> dict:
                 year = ym2.group(0)
             if not make:
                 m_mk = re.search(r"\bMAKE\s+([A-Z0-9\-\s]+)", blk_text)
-                if m_mk: make = m_mk.group(1).strip()
+                if m_mk:
+                    make = m_mk.group(1).strip()
             if not model:
                 m_md = re.search(r"\bMODEL\s+([A-Z0-9\-\s]+)", blk_text)
-                if m_md: model = m_md.group(1).strip()
+                if m_md:
+                    model = m_md.group(1).strip()
 
     return {
         "year":  year or "",
@@ -146,6 +154,7 @@ async def collect_vehicle_urls(playwright) -> list:
                 href = await a.get_attribute("href")
                 if href:
                     found.add(urljoin(BASE, href))
+            # numbered pages (1..N)
             for a in await page.locator("a").all():
                 try:
                     text = (await a.inner_text() or "").strip()
@@ -206,7 +215,7 @@ async def scrape_today() -> list:
             page = await browser.new_page()
 
             json_vins   = set()
-            json_prices = dict()  # map VIN -> price seen in JSON
+            json_prices = dict()  # map VIN -> price
 
             async def handle_response(resp):
                 try:
@@ -224,22 +233,24 @@ async def scrape_today() -> list:
                 while stack:
                     cur = stack.pop()
                     if isinstance(cur, dict):
-                        for k, v in cur.items():
+                        for _, v in cur.items():
                             if isinstance(v, (dict, list)):
                                 stack.append(v)
                             elif isinstance(v, str):
                                 s = v.strip()
                                 if VIN_RE.fullmatch(s):
-                                    json_vins.add(s.upper())
+                                    vin = s.upper()
+                                    json_vins.add(vin)
+                                    # keep last known price for this vin if seen later
                                 else:
                                     p = _clean_price(s)
                                     if p and json_vins:
-                                        # associate last seen VIN if we have one; best-effort
                                         for vv in list(json_vins):
                                             json_prices.setdefault(vv, p)
                     elif isinstance(cur, list):
                         stack.extend(cur)
 
+            # register handler correctly
             page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
             for u in urls:
@@ -257,7 +268,7 @@ async def scrape_today() -> list:
 
                     specs = extract_specs_from_html(html, url_hint=u)
 
-                    # fill missing VIN/price from JSON signals
+                    # backfill from JSON if needed
                     if not specs["vin"] and json_vins:
                         used = {r["vin"] for r in rows if r.get("vin")}
                         for v in json_vins:
@@ -285,12 +296,21 @@ async def scrape_today() -> list:
         return list(uniq.values())
 
 # ----------------------------
-# IO / diff / rollup (now includes price changes)
+# IO / diff / rollup (price-change aware)
 # ----------------------------
 def load_prev_inventory(path: str) -> pd.DataFrame:
+    required_cols = ["date", "year", "make", "model", "vin", "price", "url"]
     if Path(path).exists():
-        return pd.read_csv(path, dtype=str).fillna("")
-    return pd.DataFrame(columns=["date","year","make","model","vin","price","url"])
+        prev = pd.read_csv(path, dtype=str).fillna("")
+    else:
+        prev = pd.DataFrame(columns=required_cols)
+
+    # Backfill missing columns from older snapshots (e.g., no 'price' yet)
+    for c in required_cols:
+        if c not in prev.columns:
+            prev[c] = ""
+
+    return prev[required_cols]
 
 def rollup(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -316,8 +336,8 @@ def main():
     # scrape
     rows = asyncio.run(scrape_today())
     df = pd.DataFrame(rows).drop_duplicates(subset=["vin"]).fillna("")
-    # ensure price is numeric-like string
-    if "price" not in df.columns: df["price"] = ""
+    if "price" not in df.columns:
+        df["price"] = ""
     df["price"] = df["price"].astype(str).str.replace(r"[^0-9]", "", regex=True)
     df.insert(0, "date", today)
 
@@ -334,7 +354,7 @@ def main():
         added   = df[df["vin"].isin(curr_vins - prev_vins)].copy()
         removed = prev[prev["vin"].isin(prev_vins - curr_vins)].copy()
 
-    # compute price changes (VIN present in both, price differs and both non-empty)
+    # compute price changes
     price_changes = pd.DataFrame(columns=["date","vin","year","make","model","old_price","new_price","delta","url"])
     if not prev.empty:
         merged = pd.merge(
@@ -342,12 +362,17 @@ def main():
             df[["vin","price","year","make","model","url"]],
             on="vin", how="inner", suffixes=("_old","_new")
         )
+
         def to_int(s):
-            try: return int(str(s).replace(",","").strip())
-            except: return None
+            try:
+                return int(str(s).replace(",","").strip())
+            except Exception:
+                return None
+
         changed = []
         for _, r in merged.iterrows():
-            old = to_int(r["price_old"]); new = to_int(r["price_new"])
+            old = to_int(r["price_old"])
+            new = to_int(r["price_new"])
             if old is not None and new is not None and old != new:
                 changed.append({
                     "date": today,
