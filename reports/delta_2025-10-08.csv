@@ -1,15 +1,1 @@
-date,year,make,model,vin,url,change
-2025-10-08,2020,CHEVROLET,EQUINOX,3GNAXHEV1LS653668,https://www.carboxautosales.com/inventory/chevrolet/equinox/42436756/,added
-2025-10-08,2022,CHEVROLET,MALIBU,1G1ZD5ST2NF123747,https://www.carboxautosales.com/inventory/chevrolet/malibu/123747/,added
-2025-10-08,2022,CHEVROLET,MALIBU,1G1ZD5ST5NF121944,https://www.carboxautosales.com/inventory/chevrolet/malibu/b121944/,added
-2025-10-08,2020,CHRYSLER,PACIFICA,2C4RC1BG8LR108231,https://www.carboxautosales.com/inventory/chrysler/pacifica/108231/,added
-2025-10-08,2019,DODGE,CHARGER,2C3CDXBG4KH670674,https://www.carboxautosales.com/inventory/dodge/charger/w670674/,added
-2025-10-08,2016,FORD,FUSION,3FA6P0HD1GR258038,https://www.carboxautosales.com/inventory/ford/fusion/c258038/,added
-2025-10-08,2019,HONDA,CIVIC,2HGFC2F61KH500175,https://www.carboxautosales.com/inventory/honda/civic/500175/,added
-2025-10-08,2018,HONDA,CIVIC,JHMFC1F97JX018631,https://www.carboxautosales.com/inventory/honda/civic/b018631/,added
-2025-10-08,2015,JEEP,WRANGLER,1C4HJWFG2FL708023,https://www.carboxautosales.com/inventory/jeep/wrangler/c708023/,added
-2025-10-08,2023,KIA,SOUL,KNDJ23AU9P7858148,https://www.carboxautosales.com/inventory/kia/soul/c785148/,added
-2025-10-08,2019,MERCEDES-BENZ,GLC,WDC0G4JB6KV165456,https://www.carboxautosales.com/inventory/mercedes-benz/glc/165464/,added
-2025-10-08,2019,MINI,HARDTOP-4-DOOR,WMWXU1C50K2H74059,https://www.carboxautosales.com/inventory/mini/hardtop-4-door/h74059/,added
-2025-10-08,2022,NISSAN,ALTIMA,1N4BL4DV5NN378067,https://www.carboxautosales.com/inventory/nissan/altima/378067/,added
-2025-10-08,2025,TOYOTA,COROLLA,5YFB4MDE8SP247429,https://www.carboxautosales.com/inventory/toyota/corolla/c246429/,removed
+date,year,make,model,vin,price,url,change
