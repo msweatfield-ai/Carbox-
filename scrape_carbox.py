@@ -194,22 +194,16 @@ async def scrape_today() -> list:
         try:
             page = await browser.new_page()
 
-            # Capture VINs that appear only in background JSON calls
             json_vins = set()
 
-            def looks_like_inventory_json(resp):
+            async def handle_response(resp):
+                """Collect any VINs present in background JSON responses."""
                 try:
                     ct = (resp.headers or {}).get("content-type", "")
                 except Exception:
                     ct = ""
                 url = resp.url.lower()
-                return ("application/json" in ct) and (
-                    "/inventory" in url or "vehicle" in url or "listing" in url or "stock" in url
-                )
-
-            @page.on("response")
-            async def handle_response(resp):
-                if not looks_like_inventory_json(resp):
+                if ("application/json" not in ct) or not any(k in url for k in ["/inventory", "vehicle", "listing", "stock"]):
                     return
                 try:
                     data = await resp.json()
@@ -226,6 +220,9 @@ async def scrape_today() -> list:
                                 json_vins.add(v.strip().upper())
                     elif isinstance(cur, list):
                         stack.extend(cur)
+
+            # ✅ Correct way to register the event handler
+            page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
             for u in urls:
                 try:
