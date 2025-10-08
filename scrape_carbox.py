@@ -1,4 +1,3 @@
-\
 import asyncio, re, os, datetime
 from pathlib import Path
 import pandas as pd
@@ -24,7 +23,6 @@ def extract_specs(html, url_hint=""):
     canonical = soup.find("link", rel="canonical")
     url = canonical["href"] if canonical and canonical.get("href") else (url_hint or "")
 
-    # try to infer make/model from URL structure
     make = model = year = None
     if url and "/inventory/" in url:
         parts = url.split("/inventory/")[-1].strip("/").split("/")
@@ -36,7 +34,6 @@ def extract_specs(html, url_hint=""):
     if ym:
         year = ym.group(0)
 
-    # try SPECIFICATIONS block labels if present
     spec_block = soup.find(string=re.compile(r"SPECIFICATIONS", re.I))
     if spec_block:
         blk = spec_block.find_parent()
@@ -61,67 +58,72 @@ def extract_specs(html, url_hint=""):
     }
 
 async def collect_vehicle_urls(playwright):
-    browser = await playwright.chromium.launch()
-    page = await browser.new_page()
-    await page.goto(INV_URL, wait_until="networkidle")
-    # try to expand/lazy-load
-    for _ in range(10):
-        await page.mouse.wheel(0, 20000)
-        await page.wait_for_timeout(600)
+    browser = await playwright.chromium.launch()  # FIXED
+    try:
+        page = await browser.new_page()
+        await page.goto(INV_URL, wait_until="networkidle")
 
-    # some sites paginate; try to click "Next" until disabled (best effort)
-    urls = set()
+        # scroll to trigger lazy-load
+        for _ in range(10):
+            await page.mouse.wheel(0, 20000)
+            await page.wait_for_timeout(600)
 
-    async def harvest():
-        anchors = await page.locator("a").all()
-        for a in anchors:
-            href = await a.get_attribute("href")
-            if not href: 
-                continue
-            if href.startswith("/"):
-                href = BASE + href
-            if "/inventory/" in href:
-                tail = href.split("/inventory/")[-1].strip("/")
-                # detail pages typically have at least 3 segments: make/model/id
-                if len(tail.split("/")) >= 3:
-                    urls.add(href.split("?")[0].split("#")[0])
+        urls = set()
 
-    await harvest()
+        async def harvest():
+            anchors = await page.locator("a").all()
+            for a in anchors:
+                href = await a.get_attribute("href")
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = BASE + href
+                if "/inventory/" in href:
+                    tail = href.split("/inventory/")[-1].strip("/")
+                    if len(tail.split("/")) >= 3:
+                        urls.add(href.split("?")[0].split("#")[0])
 
-    # naive next buttons
-    while True:
-        next_btn = page.locator("a,button", has_text=re.compile(r"next|older|>", re.I)).first
-        try:
-            if await next_btn.count() == 0:
+        await harvest()
+
+        # try a generic "next" clicker (best-effort)
+        while True:
+            next_btn = page.locator("a,button", has_text=re.compile(r"next|older|>", re.I)).first
+            try:
+                if await next_btn.count() == 0:
+                    break
+                disabled = await next_btn.get_attribute("disabled")
+                if disabled is not None:
+                    break
+                await next_btn.click()
+                await page.wait_for_timeout(1200)
+                await harvest()
+            except Exception:
                 break
-            disabled = await next_btn.get_attribute("disabled")
-            if disabled is not None:
-                break
-            await next_btn.click()
-            await page.wait_for_timeout(1200)
-            await harvest()
-        except Exception:
-            break
 
-    await browser.close()
-    return sorted(urls)
+        return sorted(urls)
+    finally:
+        await browser.close()  # FIXED
 
 async def scrape_today():
     async with async_playwright() as pw:
         urls = await collect_vehicle_urls(pw)
 
         rows = []
-        async with pw.chromium.launch() as browser:
+        browser = await pw.chromium.launch()  # FIXED: no "async with"
+        try:
             page = await browser.new_page()
             for u in urls:
                 try:
                     await page.goto(u, wait_until="domcontentloaded", timeout=45000)
                     html = await page.content()
                     specs = extract_specs(html, url_hint=u)
-                    if specs["vin"]:  # keep only with VIN for stable diffs
+                    if specs["vin"]:
                         rows.append(specs)
                 except Exception:
                     pass
+        finally:
+            await browser.close()  # FIXED
+
         return rows
 
 def load_prev_inventory(path):
@@ -165,7 +167,6 @@ def main():
              .agg(count="count", vins=lambda v: ", ".join(sorted(set(v))))
              .reset_index()
         )
-        # sort nicely
         return r.sort_values(["year","make","model"]).reset_index(drop=True)
 
     added_roll = rollup(added)
@@ -175,14 +176,11 @@ def main():
     removed_roll.to_csv(out_dir / f"removed_by_group_{today}.csv", index=False)
 
     delta_path = out_dir / f"delta_{today}.csv"
-    pd.concat([
-        added.assign(change="added"),
-        removed.assign(change="removed")
-    ], ignore_index=True).to_csv(delta_path, index=False)
+    pd.concat([added.assign(change="added"), removed.assign(change="removed")],
+              ignore_index=True).to_csv(delta_path, index=False)
 
-    # console summary for Actions logs
     print(f"Vehicles today: {len(df)}")
-    print(f"Added: {len(added_roll)} groups; Removed: {len(removed_roll)} groups")
+    print(f"Added groups: {len(added_roll)} | Removed groups: {len(removed_roll)}")
 
 if __name__ == "__main__":
     main()
